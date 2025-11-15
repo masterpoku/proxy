@@ -1,0 +1,19 @@
+#!/bin/bash
+
+COUNTRIES=(
+  "Singapore"
+  "Australia"
+  "United_States"
+  "Netherlands"
+)
+
+
+while true; do
+  clear
+  RAND=${COUNTRIES[$RANDOM % ${#COUNTRIES[@]}]}
+  echo "🌍 Connect VPN ke: $RAND"
+  nordvpn c "$RAND"
+
+  echo "🚀 Menjalankan Proxy Bot..."
+  python test.py
+done
