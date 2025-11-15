@@ -1,11 +1,18 @@
 #!/bin/bash
 
 COUNTRIES=(
-  "Singapore"
-  "Australia"
   "United_States"
+  "United_Kingdom"
+  "Germany"
+  "Canada"
+  "Australia"
   "Netherlands"
+  "France"
+  "Sweden"
+  "Japan"
+  "Singapore"
 )
+
 
 
 while true; do
