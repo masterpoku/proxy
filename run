@@ -15,5 +15,5 @@ while true; do
   nordvpn c "$RAND"
 
   echo "🚀 Menjalankan Proxy Bot..."
-  python test.py
+  python proxy.py
 done
