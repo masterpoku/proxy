@@ -3,40 +3,56 @@
 
 import socket
 import threading
-import time
+import struct
 import os
-from flask import Flask, jsonify
 
-# ==============================================
-# KONFIGURASI PROXY LOKAL
-# ==============================================
-LOCAL_SOCKS_PORT = 30999
+SOCKS_PORT = 30999
 
-# bersihkan port jika kepake
-os.system(f"fuser -k {LOCAL_SOCKS_PORT}/tcp >/dev/null 2>&1")
+def handle_client(conn):
+    try:
+        # ========== HANDSHAKE ==========
+        version, nmethods = conn.recv(2)
+        conn.recv(nmethods)
+        conn.sendall(b"\x05\x00")  # NO AUTH
 
-# ==============================================
-# FLASK API
-# ==============================================
-app = Flask(__name__)
+        # ========== REQUEST HEADER ==========
+        ver, cmd, _, atyp = conn.recv(4)
 
-@app.get("/status")
-def status():
-    return jsonify({"running": True})
+        # CMD harus 1 = CONNECT
+        if cmd != 1:
+            conn.close()
+            return
 
-@app.get("/exit")
-def exit_app():
-    print("❌ EXIT requested via /exit")
-    os._exit(0)
+        # ========== PARSING ADDRESS ==========
+        if atyp == 1:  # IPv4
+            addr = socket.inet_ntoa(conn.recv(4))
+        elif atyp == 3:  # DOMAIN
+            domain_len = conn.recv(1)[0]
+            addr = conn.recv(domain_len).decode()
+        else:
+            conn.close()
+            return
 
-def run_flask():
-    print("🌐 Flask running on http://0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+        port = struct.unpack(">H", conn.recv(2))[0]
 
-# ==============================================
-# FORWARDING
-# ==============================================
-def forward(src, dst):
+        # ========== CONNECT KE SERVER ASLI ==========
+        remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        remote.connect((addr, port))
+
+        # balas success
+        reply = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        conn.sendall(reply)
+
+        # ========== FORWARD 2 ARAH ==========
+        threading.Thread(target=pipe, args=(conn, remote)).start()
+        threading.Thread(target=pipe, args=(remote, conn)).start()
+
+    except Exception as e:
+        print("[ERR]", e)
+        try: conn.close()
+        except: pass
+
+def pipe(src, dst):
     try:
         while True:
             data = src.recv(4096)
@@ -51,90 +67,20 @@ def forward(src, dst):
         try: dst.close()
         except: pass
 
-# ==============================================
-# HANDLE CLIENT (SOCKS5)
-# ==============================================
-def handle_client(client_sock):
-    try:
-        # handshake
-        data = client_sock.recv(2)
-        if len(data) < 2 or data[0] != 5:
-            client_sock.close()
-            return
+def start_server():
+    if os.system(f"fuser -k {SOCKS_PORT}/tcp >/dev/null 2>&1") == 0:
+        print("Killed previous process.")
 
-        n_methods = data[1]
-        client_sock.recv(n_methods)
-        client_sock.sendall(b"\x05\x00")  # no auth
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(("0.0.0.0", SOCKS_PORT))
+    server.listen(200)
 
-        # request
-        data = client_sock.recv(4)
-        if len(data) < 4 or data[1] != 1:
-            client_sock.close()
-            return
-
-        atyp = data[3]
-
-        if atyp == 1:  # IPv4
-            addr = socket.inet_ntoa(client_sock.recv(4))
-        elif atyp == 3:  # domain
-            ln = client_sock.recv(1)[0]
-            addr = client_sock.recv(ln).decode()
-        else:
-            client_sock.close()
-            return
-
-        port = int.from_bytes(client_sock.recv(2), "big")
-
-        print(f"[SOCKS] Client requests {addr}:{port}")
-
-        # CONNECT langsung ke internet (no upstream)
-        dst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        dst.connect((addr, port))
-
-        # reply success
-        reply = b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + b"\x00\x00"
-        client_sock.sendall(reply)
-
-        # forward dua arah
-        threading.Thread(target=forward, args=(client_sock, dst), daemon=True).start()
-        threading.Thread(target=forward, args=(dst, client_sock), daemon=True).start()
-
-    except Exception as e:
-        print("[ERROR]", e)
-        try: client_sock.close()
-        except: pass
-
-# ==============================================
-# SOCKS5 SERVER
-# ==============================================
-def run_socks():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # agar bisa dipakai laptop B
-    s.bind(("0.0.0.0", LOCAL_SOCKS_PORT))
-
-    s.listen(200)
-    print(f"[SOCKS5] Listening on 0.0.0.0:{LOCAL_SOCKS_PORT}")
+    print(f"[SOCKS5] Running on 0.0.0.0:{SOCKS_PORT}")
 
     while True:
-        c, addr = s.accept()
-        print(f"[NEW CLIENT] {addr}")
-        threading.Thread(target=handle_client, args=(c,), daemon=True).start()
+        conn, addr = server.accept()
+        print("[Client]", addr)
+        threading.Thread(target=handle_client, args=(conn,)).start()
 
-# ==============================================
-# MAIN
-# ==============================================
 if __name__ == "__main__":
-    # start SOCKS5
-    threading.Thread(target=run_socks, daemon=True).start()
-
-    # start Flask
-    threading.Thread(target=run_flask, daemon=True).start()
-
-    print("🔥 PROXY SERVER ACTIVE (NO UPSTREAM)")
-    print(f"   SOCKS5  : 0.0.0.0:{LOCAL_SOCKS_PORT}")
-    print("   FLASK   : http://0.0.0.0:5000")
-
-    while True:
-        time.sleep(1)
+    start_server()
