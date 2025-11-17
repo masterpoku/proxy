@@ -21,7 +21,7 @@ do
     echo "🌍 Menggunakan config: $RANDOM_OVPN"
 
     # Start VPN (foreground supaya loop tunggu sampai selesai)
-    sudo openvpn --config "$RANDOM_OVPN" --auth-user-pass auth.txt
+    sudo openvpn --config "$RANDOM_OVPN" 
 
     echo "⚠️  VPN DISCONNECTED! Mengganti server..."
     sleep 2
