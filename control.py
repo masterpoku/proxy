@@ -2,129 +2,248 @@
 # -*- coding: utf-8 -*-
 
 import os
-import socket
-import threading
 import time
+import random
+import subprocess
+import requests
 from flask import Flask, jsonify
 
-# ======================================================
-#                 SOCKS5 SERVER
-# ======================================================
+# ======================================
+# KONFIGURASI
+# ======================================
 
-LOCAL_PORT = 30999
-os.system(f"fuser -k {LOCAL_PORT}/tcp >/dev/null 2>&1")
+# Folder semua .ovpn (boleh relative seperti di log kamu)
+OVPN_DIR = "OpenVPN256"
 
-def handle_client(client):
-    try:
-        client.recv(262)
-        client.sendall(b"\x05\x00")
+# File user/pass kalau .ovpn pakai auth-user-pass
+AUTH_FILE = "auth.txt"          # kalau ga pakai auth-user-pass, biarin aja
 
-        data = client.recv(4)
-        atyp = data[3]
+# Lokasi log openvpn
+LOG_FILE = "/var/log/openvpn.log"
 
-        if atyp == 1:
-            addr = socket.inet_ntoa(client.recv(4))
-        elif atyp == 3:
-            length = client.recv(1)[0]
-            addr = client.recv(length).decode()
-        else:
-            client.close()
-            return
+# Socks5 lokal (proxy_forwarder.py)
+SOCKS_PORT = 30999
 
-        port = int.from_bytes(client.recv(2), "big")
-        remote = socket.create_connection((addr, port))
+# Maksimal waktu nunggu VPN bener-bener ready (detik)
+TIMEOUT_CONNECT = 40
 
-        reply = b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"
-        client.sendall(reply)
-
-    except:
-        client.close()
-        return
-
-    def relay(src, dst):
-        try:
-            while True:
-                data = src.recv(4096)
-                if not data:
-                    break
-                dst.sendall(data)
-        except:
-            pass
-        finally:
-            src.close()
-            dst.close()
-
-    threading.Thread(target=relay, args=(client, remote), daemon=True).start()
-    threading.Thread(target=relay, args=(remote, client), daemon=True).start()
-
-
-def start_socks_thread():
-    def run_socks():
-        while True:
-            try:
-                server = socket.socket()
-                server.bind(("0.0.0.0", LOCAL_PORT))
-                server.listen(200)
-                print(f"[SOCKS5] Running on {LOCAL_PORT}")
-                break
-            except:
-                print("[SOCKS5] Port busy, retrying 2s…")
-                time.sleep(2)
-
-        while True:
-            client, _ = server.accept()
-            threading.Thread(target=handle_client, args=(client,), daemon=True).start()
-
-    threading.Thread(target=run_socks, daemon=True).start()
-
-
-# ======================================================
-#                 FLASK CONTROL API
-# ======================================================
+# Global state
+CURRENT_OVPN = None
 
 app = Flask(__name__)
-STATUS_FILE = "status.txt"
 
-def write_status(val):
-    with open(STATUS_FILE, "w") as f:
-        f.write(str(val))
 
-def read_status():
-    return open(STATUS_FILE).read().strip()
+# ======================================
+# UTIL UMUM
+# ======================================
 
-@app.get("/start")
-def start():
-    write_status(1)
-    return jsonify({"status": "START REQUEST SENT"})
+def sh(cmd: str) -> int:
+    """Jalankan shell command, return exit code."""
+    return os.system(cmd)
+
+
+def stop_socks5():
+    """Matikan socks5 forwarder (proxy_forwarder.py) & bebasin port."""
+    sh("pkill -f proxy_forwarder.py 2>/dev/null")
+    sh(f"fuser -k {SOCKS_PORT}/tcp 2>/dev/null")
+    print("[SOCKS5] STOPPED")
+
+
+def start_socks5():
+    """Start socks5 forwarder SETELAH VPN ready."""
+    stop_socks5()
+    # Sesuaikan nama file kalau beda
+    subprocess.Popen("python proxy_forwarder.py", shell=True)
+    print(f"[SOCKS5] STARTED at 127.0.0.1:{SOCKS_PORT}")
+
+
+def stop_vpn():
+    """Matikan semua proses OpenVPN."""
+    global CURRENT_OVPN
+    sh("killall openvpn 2>/dev/null")
+    CURRENT_OVPN = None
+    print("[VPN] STOPPED")
+    time.sleep(1)
+
+
+def wait_for_log_ready() -> bool:
+    """
+    Tunggu sampai log OpenVPN mengandung 'Initialization Sequence Completed'
+    Artinya handshake + tunnel sudah selesai dibuat.
+    """
+    start = time.time()
+    while time.time() - start < TIMEOUT_CONNECT:
+        try:
+            if os.path.isfile(LOG_FILE):
+                with open(LOG_FILE, "r", errors="ignore") as f:
+                    if "Initialization Sequence Completed" in f.read():
+                        print("[VPN] LOG OK: Initialization Sequence Completed")
+                        return True
+        except Exception as e:
+            print(f"[VPN] LOG READ ERROR: {e}")
+        time.sleep(1)
+    print("[VPN] LOG TIMEOUT")
+    return False
+
+
+def wait_for_tun0() -> bool:
+    """Tunggu sampai interface tun0 muncul."""
+    start = time.time()
+    while time.time() - start < TIMEOUT_CONNECT:
+        if sh("ip a show tun0 >/dev/null 2>&1") == 0:
+            print("[VPN] tun0 FOUND")
+            return True
+        time.sleep(1)
+    print("[VPN] tun0 NOT FOUND (TIMEOUT)")
+    return False
+
+
+def get_public_ip() -> str | None:
+    """Ambil IP publik sekarang (tanpa peduli sebelumnya)."""
+    try:
+        r = requests.get("https://api64.ipify.org?format=json", timeout=5)
+        r.raise_for_status()
+        ip = r.json().get("ip")
+        if ip:
+            print(f"[VPN] PUBLIC IP: {ip}")
+            return ip
+    except Exception as e:
+        print(f"[VPN] GET IP ERROR: {e}")
+    return None
+
+
+def wait_for_public_ip() -> str | None:
+    """Retry beberapa kali sampai bisa dapat IP publik."""
+    for _ in range(12):   # 12 x 2 detik ≈ 24 detik
+        ip = get_public_ip()
+        if ip:
+            return ip
+        time.sleep(2)
+    print("[VPN] FAILED GET PUBLIC IP (TIMEOUT)")
+    return None
+
+
+def start_vpn_random():
+    """
+    Start OpenVPN pakai file .ovpn random,
+    lalu tunggu sampai:
+      - log ready
+      - tun0 aktif
+      - IP publik bisa diambil
+    Baru nyalain socks5.
+    """
+    global CURRENT_OVPN
+
+    # Ambil list .ovpn
+    files = []
+    if os.path.isdir(OVPN_DIR):
+        for name in os.listdir(OVPN_DIR):
+            if name.endswith(".ovpn"):
+                files.append(os.path.join(OVPN_DIR, name))
+
+    if not files:
+        print("[VPN] NO .ovpn FILES FOUND")
+        return False, "NO_OVPN_FILES"
+
+    chosen = random.choice(files)
+    CURRENT_OVPN = chosen
+    print(f"[VPN] CHOSEN OVPN: {chosen}")
+
+    # Bersihin log
+    sh(f"> {LOG_FILE}")
+
+    # Start OpenVPN (daemon)
+    if os.path.isfile(AUTH_FILE):
+        cmd = (
+            f"openvpn --daemon "
+            f"--config '{chosen}' "
+            f"--log '{LOG_FILE}'"
+        )
+    else:
+        cmd = (
+            f"openvpn --daemon "
+            f"--config '{chosen}' "
+            f"--log '{LOG_FILE}'"
+        )
+
+    print(f"[VPN] START CMD: {cmd}")
+    sh(cmd)
+
+    # 1) Tunggu log 'Initialization Sequence Completed'
+    if not wait_for_log_ready():
+        stop_vpn()
+        return False, "LOG_TIMEOUT"
+
+    # 2) Tunggu interface tun0 aktif
+    if not wait_for_tun0():
+        stop_vpn()
+        return False, "TUN0_NOT_FOUND"
+
+    # (route check dihapus karena environment kamu bisa pakai split route)
+
+    # 3) Tunggu IP publik bisa diambil (harusnya sudah lewat VPN)
+    ip = wait_for_public_ip()
+    if not ip:
+        stop_vpn()
+        return False, "PUBLIC_IP_TIMEOUT"
+
+    # 4) Kalau semua OK → start socks5
+    start_socks5()
+
+    return True, {"ovpn": chosen, "ip": ip}
+
+
+# ======================================
+# API ENDPOINTS
+# ======================================
 
 @app.get("/stop")
-def stop():
-    write_status(0)
-    return jsonify({"status": "STOP REQUEST SENT"})
+def api_stop():
+    stop_socks5()
+    stop_vpn()
+    return jsonify({"status": "STOPPED"})
+
+
+@app.get("/start")
+def api_start():
+    stop_socks5()
+    ok, detail = start_vpn_random()
+    if ok:
+        return jsonify({"status": "CONNECTED", "detail": detail})
+    return jsonify({"status": "FAILED", "reason": detail})
+
 
 @app.get("/rotate")
-def rotate():
-    write_status(2)
-    return jsonify({"status": "ROTATE REQUEST SENT"})
+def api_rotate():
+    stop_socks5()
+    stop_vpn()
+    ok, detail = start_vpn_random()
+    if ok:
+        return jsonify({"status": "ROTATED", "detail": detail})
+    return jsonify({"status": "FAILED", "reason": detail})
+
 
 @app.get("/status")
-def status():
-    running = os.system("pgrep openvpn >/dev/null") == 0
-    ip = os.popen("curl -s https://api.ipify.org").read().strip()
+def api_status():
+    running = (sh("pgrep -x openvpn >/dev/null 2>&1") == 0)
     return jsonify({
-        "vpn_running": running,
-        "vpn_status": read_status(),
-        "ip": ip
+        "running": running,
+        "ovpn": CURRENT_OVPN,
+        "ip": get_public_ip(),
+        "socks5": f"127.0.0.1:{SOCKS_PORT}"
     })
 
 
-# ======================================================
-#                 MAIN ENTRY
-# ======================================================
+@app.get("/exit")
+def api_exit():
+    os._exit(0)
+
+
+# ======================================
+# MAIN
+# ======================================
 
 if __name__ == "__main__":
-    print("🔥 Starting SOCKS5 server…")
-    start_socks_thread()
-
-    print("🔥 Starting Flask API on port 5000…")
+    os.system("fuser -k 5000/tcp > /dev/null 2>&1")
+    print("🔥 VPN + SOCKS5 Controller running on 0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False)
