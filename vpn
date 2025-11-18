@@ -1,0 +1,64 @@
+#!/bin/bash
+
+OVPN_DIR="OpenVPN256"
+LOG="vpn.log"
+IP_FILE="ip.txt"
+CMD_FILE="vpn_cmd.txt"
+
+# set default command
+echo "IDLE" > "$CMD_FILE"
+
+# function start VPN random
+start_vpn() {
+    # stop yang lama
+    killall openvpn 2>/dev/null
+    sleep 1
+
+    # random pick
+    FILES=("$OVPN_DIR"/*.ovpn)
+    COUNT=${#FILES[@]}
+    RAND=$(( RANDOM % COUNT ))
+    CHOSEN="${FILES[$RAND]}"
+
+    echo "[VPN] Random pick: $CHOSEN"
+
+    # bersihkan log & ip
+    > "$LOG"
+    > "$IP_FILE"
+
+    # start openvpn background
+    openvpn --config "$CHOSEN" --log "$LOG" &
+    PID=$!
+
+    echo "[VPN] PID: $PID"
+
+    # tunggu openvpn siap
+    sleep 6
+
+    # ambil IP baru (via tun0)
+    NEWIP=$(curl  https://api64.ipify.org || echo "N/A")
+    echo "$NEWIP" > "$IP_FILE"
+
+    echo "[VPN] NEW IP: $NEWIP"
+}
+
+# main loop
+while true
+do
+    CMD=$(cat "$CMD_FILE")
+
+    if [ "$CMD" = "START" ]; then
+        echo "[LOOP] Start command detected"
+        start_vpn
+        echo "IDLE" > "$CMD_FILE"
+    fi
+
+    if [ "$CMD" = "STOP" ]; then
+        echo "[LOOP] Stop command detected"
+        killall openvpn 2>/dev/null
+        echo "OFF" > "$IP_FILE"
+        echo "IDLE" > "$CMD_FILE"
+    fi
+
+    sleep 1
+done
