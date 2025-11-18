@@ -28,6 +28,7 @@ start_vpn() {
 
     # start openvpn background
     openvpn --config "$CHOSEN" --log "$LOG" &
+    
     PID=$!
 
     echo "[VPN] PID: $PID"
