@@ -27,20 +27,9 @@ start_vpn() {
     > "$IP_FILE"
 
     # start openvpn background
-    openvpn --config "$CHOSEN" --log "$LOG" &
-    
-    PID=$!
+    openvpn --config "$CHOSEN" 
 
-    echo "[VPN] PID: $PID"
-
-    # tunggu openvpn siap
-    sleep 6
-
-    # ambil IP baru (via tun0)
-    NEWIP=$(curl  https://api64.ipify.org || echo "N/A")
-    echo "$NEWIP" > "$IP_FILE"
-
-    echo "[VPN] NEW IP: $NEWIP"
+  
 }
 
 # main loop

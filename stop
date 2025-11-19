@@ -1,0 +1,1 @@
+killall openvpn 2>/dev/null

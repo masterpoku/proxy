@@ -15,6 +15,7 @@ def start_vpn():
 @app.get("/stop")
 def stop_vpn():
     open(CMD_FILE, "w").write("STOP")
+    os.system("bash stop")
     time.sleep(1)
     return jsonify({"status": "STOP_TRIGGER_SENT"})
 
